@@ -7,11 +7,12 @@
     Читает ollama-windows-amd64.ini и последовательно:
       1. Останавливает и удаляет службу Windows.
       2. Удаляет правило брандмауэра.
-      3. Сбрасывает Machine-переменные OLLAMA_HOST / OLLAMA_MODELS.
-      4. По флагам -PurgeProfile / -PurgeModels удаляет каталоги профиля
+      3. Убирает OllamaDir из Machine PATH (если AddToPath=true).
+      4. Сбрасывает Machine-переменные OLLAMA_HOST / OLLAMA_MODELS.
+      5. По флагам -PurgeProfile / -PurgeModels удаляет каталоги профиля
          (.ollama) и моделей.
-      5. По флагу -PurgeOllama удаляет каталог с бинарниками.
-      6. По флагу -PurgeLogs удаляет каталог логов.
+      6. По флагу -PurgeOllama удаляет каталог с бинарниками.
+      7. По флагу -PurgeLogs удаляет каталог логов.
     NSSM и сам INI по умолчанию НЕ удаляются.
 
 .PARAMETER ConfigPath
@@ -19,22 +20,18 @@
 
 .PARAMETER PurgeProfile
     Удалить каталог <OllamaHome>\.ollama (с ключом id_ed25519!).
-    Без этого флага профиль сохраняется.
 
 .PARAMETER PurgeModels
-    Удалить каталог моделей <ModelsDir>. Может быть большим — по умолчанию
-    НЕ удаляется.
+    Удалить каталог моделей <ModelsDir>.
 
 .PARAMETER PurgeOllama
-    Удалить каталог с бинарниками <OllamaDir> (после удаления службы).
-    Если в OllamaDir лежит .ollama и не задан -PurgeProfile, каталог
-    сохраняется, чтобы не потерять ключ.
+    Удалить каталог с бинарниками <OllamaDir>.
 
 .PARAMETER PurgeLogs
     Удалить каталог логов <LogsDir>.
 
 .PARAMETER Force
-    Не задавать интерактивных подтверждений для деструктивных операций.
+    Не задавать интерактивных подтверждений.
 
 .PARAMETER NoPause
     Не ждать Enter в конце.
@@ -132,6 +129,7 @@ $NssmDir     = Get-Cfg     'paths'   'NssmDir'          'C:\Program Files\NSSM'
 $LogsDir     = Get-Cfg     'paths'   'LogsDir'          ''
 $OllamaHome  = Get-Cfg     'ollama'  'OllamaHome'       $OllamaDir
 $ServiceName = Get-Cfg     'service' 'ServiceName'      'Ollama'
+$AddToPath   = Get-CfgBool 'service' 'AddToPath'        $true
 $Port        = [int](Get-Cfg 'network' 'Port'           '11434')
 $FwEnabled   = Get-CfgBool 'network' 'FirewallEnabled'  $true
 $FwSubnet    = Get-Cfg     'network' 'FirewallSubnet'   ''
@@ -156,6 +154,25 @@ function Find-Nssm {
             Select-Object -First 1 -ExpandProperty FullName
     }
     return $exe
+}
+
+function Remove-FromMachinePath {
+    param([string]$Dir)
+    $current = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    if ($null -eq $current -or $current.Trim() -eq '') {
+        Write-Host '  ℹ PATH не задан'
+        return
+    }
+    $parts = $current -split ';' | Where-Object { $_ -ne '' }
+    $target = $Dir.TrimEnd('\')
+    $kept = $parts | Where-Object { $_.TrimEnd('\') -ne $target }
+    if ($kept.Count -eq $parts.Count) {
+        Write-Host "  ℹ $Dir в PATH не найден"
+        return
+    }
+    [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'Machine')
+    Write-Host "  ✓ $Dir удалён из PATH"
+    Write-Host '  ℹ Изменения вступят в силу в новых консолях.'
 }
 
 try {
@@ -194,6 +211,14 @@ try {
         Write-Host "  ✓ Удалено правил: $($rules.Count)"
     } else {
         Write-Host '  ℹ Правил не найдено'
+    }
+
+    # ─── 3b. PATH ───
+    if ($AddToPath) {
+        Write-Step 'Переменная PATH (Machine)'
+        Remove-FromMachinePath -Dir $OllamaDir
+    } else {
+        Write-Host "`n  ℹ AddToPath=false — PATH не трогаем" -ForegroundColor DarkGray
     }
 
     # ─── 4. Machine-переменные ───
@@ -263,7 +288,7 @@ try {
         Write-Host '  ℹ Отсутствует'
     }
 
-    # ─── 8. Логи (опционально) ───
+    # ─── 8. Логи ───
     Write-Step "Логи: $LogsDir"
     if (Test-Path $LogsDir) {
         if ($PurgeLogs) {
@@ -280,7 +305,7 @@ try {
         Write-Host '  ℹ Отсутствует'
     }
 
-    # ─── Итог (исправлено: без тернарного оператора) ───
+    # ─── Итог ───
     $pProfile = if ($PurgeProfile) { 'удалён' } else { 'сохранён' }
     $pModels  = if ($PurgeModels)  { 'удалён' } else { 'сохранён' }
     $pOllama  = if ($PurgeOllama)  { 'удалён' } else { 'сохранён' }
