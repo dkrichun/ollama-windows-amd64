@@ -301,7 +301,16 @@ function Invoke-PullModel {
     try {
         $env:OLLAMA_HOST   = $ApiHost         # CLI подключается к локальному API
         $env:OLLAMA_MODELS = $ModelsDir
-        & $Exe pull $Model
+        
+        # Альтернативный вывод: пайп отключает интерактивный TUI.
+        # Очищаем \r и пустые строки, чтобы прогресс не "наезжал" сам на себя.
+        & $Exe pull $Model 2>&1 | ForEach-Object {
+            $line = $_ -replace "`r", ""
+            if ($line.Trim() -ne '') {
+                Write-Host "    $line"
+            }
+        }
+        
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  ✓ $Model загружена" -ForegroundColor Green
             return $true
@@ -485,13 +494,18 @@ try {
     & $nssmExe install $ServiceName $ollamaExe serve                           2>&1 | Out-Null
     & $nssmExe set $ServiceName AppDirectory $OllamaDir                        2>&1 | Out-Null
     & $nssmExe set $ServiceName Start $StartType                               2>&1 | Out-Null
+
+    # Единый вызов AppEnvironmentExtra со всеми переменными, включая performance
     & $nssmExe set $ServiceName AppEnvironmentExtra @envPairs 2>&1 | Out-Null
 
+    # Логи и ротация
     & $nssmExe set $ServiceName AppStdout (Join-Path $LogsDir 'ollama.out.log') 2>&1 | Out-Null
     & $nssmExe set $ServiceName AppStderr (Join-Path $LogsDir 'ollama.err.log') 2>&1 | Out-Null
     & $nssmExe set $ServiceName AppRotateFiles 1                               2>&1 | Out-Null
     & $nssmExe set $ServiceName AppRotateOnline 1                              2>&1 | Out-Null
-    & $nssmExe set $ServiceName AppRotateBytes 10485760                         2>&1 | Out-Null
+    & $nssmExe set $ServiceName AppRotateBytes 10485760                         2>&1 | Out-Null  # 10 MB
+
+    # Политика перезапуска при падении
     & $nssmExe set $ServiceName AppExit Default Restart                        2>&1 | Out-Null
     & $nssmExe set $ServiceName AppRestartDelay $AppRestartDelay               2>&1 | Out-Null
     & $nssmExe set $ServiceName AppThrottle 1500                              2>&1 | Out-Null
