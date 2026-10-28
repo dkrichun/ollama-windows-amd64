@@ -7,7 +7,8 @@
     Читает ollama-windows-install.ini. При наличии установленной версии предлагает
     обновление (с возможностью выбора версии, исключая текущую). Перед обновлением
     делает резервную копию в папку Backup, останавливает службу, удаляет и
-    пересоздает её заново. Скачанные архивы сохраняются в папку Downloads.
+    пересоздает её заново. Скачанные архивы Ollama сохраняются в подпапки
+    Downloads\<версия>\ (у NSSM версия уже есть в имени файла).
 #>
 [CmdletBinding()]
 param(
@@ -202,9 +203,19 @@ function Get-FileNameFromUrl {
     return $Fallback
 }
 
+# ─── Кэширование скачанных файлов (с поддержкой подпапок) ───
 function Get-CachedFile {
-    param([string]$Url, [string]$FileName, [switch]$ForceRedownload)
-    $cachePath = Join-Path $DownloadsDir $FileName
+    param(
+        [string]$Url,
+        [string]$FileName,
+        [string]$SubDir = '',
+        [switch]$ForceRedownload
+    )
+    $targetDir = if ([string]::IsNullOrWhiteSpace($SubDir)) { $DownloadsDir } else { Join-Path $DownloadsDir $SubDir }
+    if (-not (Test-Path -LiteralPath $targetDir)) {
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+    }
+    $cachePath = Join-Path $targetDir $FileName
     $urlStamp  = "$cachePath.url"
 
     if ($KeepDownloads -and -not $ForceRedownload) {
@@ -483,7 +494,6 @@ try {
 
     # ─── Права доступа (SID для любой локализации Windows) ───
     Write-Step 'Права доступа'
-    # S-1-5-18 = SYSTEM, S-1-5-32-544 = Administrators (Администраторы)
     icacls $OllamaHome /grant '*S-1-5-18:(OI)(CI)F' | Out-Null
     icacls $OllamaHome /grant '*S-1-5-32-544:(OI)(CI)F' | Out-Null
     icacls $ModelsDir /grant '*S-1-5-18:(OI)(CI)F' | Out-Null
@@ -500,6 +510,7 @@ try {
 
     if (-not $nssmExe -or $forceDL) {
         $nssmZipName = Get-FileNameFromUrl -Url $NssmUrl -Fallback 'NSSM.zip'
+        # NSSM - без подпапки, версия уже есть в имени файла
         $nssmZip     = Get-CachedFile -Url $NssmUrl -FileName $nssmZipName -ForceRedownload:$forceDL
         Expand-Archive -Path $nssmZip -DestinationPath $NssmDir -Force
         if (-not $KeepDownloads) { Remove-Item -LiteralPath $nssmZip -Force -ErrorAction SilentlyContinue }
@@ -561,7 +572,8 @@ try {
     if (-not (Test-Path $ollamaExe) -or $forceDL -or $isUpdate) {
         Write-Host "  → Целевая версия: $targetVersion" -ForegroundColor Green
         $ollamaZipName = 'ollama-windows-amd64.zip'
-        $ollamaZip     = Get-CachedFile -Url $downloadUrl -FileName $ollamaZipName -ForceRedownload:$forceDL
+        # Ollama - в подпапку с версией, чтобы разные версии не перезаписывали друг друга
+        $ollamaZip     = Get-CachedFile -Url $downloadUrl -FileName $ollamaZipName -SubDir $targetVersion -ForceRedownload:$forceDL
         Expand-Archive -Path $ollamaZip -DestinationPath $OllamaDir -Force
         if (-not $KeepDownloads) { Remove-Item -LiteralPath $ollamaZip -Force -ErrorAction SilentlyContinue }
     } else {
@@ -692,7 +704,7 @@ try {
     Write-Host " Модели      : $ModelsDir"
     Write-Host " Профиль     : $NewProfile"
     Write-Host " Логи        : $LogsDir"
-    Write-Host " Архивы      : $DownloadsDir"
+    Write-Host " Архивы      : $DownloadsDir\<версия>\"
     Write-Host " Бэкапы      : $BackupDir"
     Write-Host " API локально: http://127.0.0.1:$Port"
     Write-Host " Performance : KeepAlive=$KeepAlive, FA=$faValue, KvCache=$KvCacheType"
