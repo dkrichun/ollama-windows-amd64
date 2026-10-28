@@ -6,9 +6,9 @@
 .DESCRIPTION
     Читает ollama-windows-install.ini. Позволяет выбрать любую версию, включая
     уже установленную (в этом случае выполняется переустановка с пересозданием
-    службы). Перед установкой/переустановкой делает резервную копию в папку
-    Backup. Скачанные архивы сохраняются в подпапки Downloads\ollama_@version@
-    и Downloads\nssm_@version@.
+    службы). Выбор версии и подтверждение переустановки происходят В САМОМ НАЧАЛЕ —
+    до остановки службы и создания бэкапов. Если пользователь отменяет на этом
+    этапе, служба продолжает работать без изменений.
 #>
 [CmdletBinding()]
 param(
@@ -176,7 +176,6 @@ $envPairs = @(
 if (-not [string]::IsNullOrWhiteSpace($Origins)) { $envPairs += "OLLAMA_ORIGINS=$Origins" }
 if ($DebugMode) { $envPairs += "OLLAMA_DEBUG=1" }
 
-# Env для диагностического запуска
 $testEnv = @{
     'USERPROFILE'            = $OllamaHome
     'HOME'                   = $OllamaHome
@@ -290,6 +289,9 @@ function Get-OllamaReleases {
     $headers = @{ 'User-Agent' = 'PowerShell-Ollama-Deploy-Script'; 'Accept' = 'application/vnd.github+json' }
     try {
         $releases = Invoke-RestMethod -Uri 'https://api.github.com/repos/ollama/ollama/releases?per_page=30' -Headers $headers -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath $DownloadsDir)) {
+            New-Item -ItemType Directory -Path $DownloadsDir -Force | Out-Null
+        }
         $releases | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
         return $releases
     } catch {
@@ -546,8 +548,6 @@ function Start-OllamaService {
             break
         }
         
-        # Вывод NSSM подавляем: при успехе он избыточен,
-        # при ошибке реальный статус покажет polling ниже.
         & $NssmExe start $ServiceName 2>&1 | Out-Null
         
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -617,7 +617,6 @@ function Start-OllamaService {
 
     Write-Host "`n  nssm dump $ServiceName :" -ForegroundColor Yellow
     try {
-        # OEM-кодировка для читаемого вывода nssm dump на любой локализации Windows
         $oemCodePage = 866
         try {
             $oemCp = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
@@ -636,79 +635,31 @@ function Start-OllamaService {
 }
 
 try {
+    # ══════════════════════════════════════════════════════════════════════
+    # ЭТАП 1: Проверка текущей версии и выбор целевой (можно отменить)
+    # ══════════════════════════════════════════════════════════════════════
+
     $ollamaExe = Join-Path $OllamaDir 'ollama.exe'
     $currentVersion = $null
-    
-    # ─── Проверка текущей версии ───
+
     if (Test-Path $ollamaExe) {
         $verOut = (& $ollamaExe --version 2>&1) -join ' '
         if ($verOut -match '(\d+\.\d+\.\d+)') {
             $currentVersion = "v$($matches[1])"
             Write-Host "`n  ℹ Обнаружена установленная версия: $currentVersion" -ForegroundColor Green
         }
-    }
-
-    if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
-        Write-Step "Остановка существующей службы $ServiceName"
-        & sc.exe stop $ServiceName 2>&1 | Out-Null
-        Start-Sleep -Seconds 2
-    }
-    Stop-OllamaProcesses
-
-    # ─── Проверка порта ───
-    Write-Step "Проверка порта $Port"
-    $busy = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-    if ($busy) {
-        $pids = ($busy.OwningProcess | Sort-Object -Unique) -join ', '
-        Write-Warning "Порт $Port уже занят PID: $pids"
-        if (-not $Force) {
-            $ans = Read-Host 'Продолжить? [y/N]'
-            if ($ans -ne 'y') { throw 'Отменено пользователем' }
-        }
     } else {
-        Write-Host '  ✓ Свободен'
+        Write-Host "`n  ℹ Ollama не установлена — будет выполнена первичная установка." -ForegroundColor Cyan
     }
 
-    # ─── Создание каталогов ───
-    Write-Step 'Создание каталогов'
-    $dirsToCreate = @($OllamaDir, $ModelsDir, $LogsDir, $NssmDir, $OllamaHome, $NewProfile, $DownloadsDir, $BackupDir)
-    foreach ($d in ($dirsToCreate | Select-Object -Unique)) {
-        New-Item -ItemType Directory -Force -Path $d | Out-Null
-        Write-Host "  ✓ $d"
-    }
-
-    # ─── Права доступа ───
-    Write-Step 'Права доступа'
-    Set-OllamaAcl -OllamaDir $OllamaDir -OllamaHome $OllamaHome -ModelsDir $ModelsDir -NewProfile $NewProfile
-    Write-Host "  ✓ Права Full Control выданы (SYSTEM + Administrators)"
-
-    # ─── NSSM ───
-    Write-Step "Установка NSSM в $NssmDir"
-    $nssmExe = Get-ChildItem -Path $NssmDir -Filter nssm.exe -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -match '\\win64\\' } |
-        Select-Object -First 1 -ExpandProperty FullName
-
-    if (-not $nssmExe -or $forceDL) {
-        $nssmZipName = Get-FileNameFromUrl -Url $NssmUrl -Fallback 'NSSM.zip'
-        $nssmVer = if ($NssmUrl -match '/download/([^/]+)/') { $matches[1] -replace '^v', '' } else { 'unknown' }
-        $nssmSubDir = "nssm_$nssmVer"
-        $nssmZip     = Get-CachedFile -Url $NssmUrl -FileName $nssmZipName -SubDir $nssmSubDir -ForceRedownload:$forceDL
-        Expand-Archive -Path $nssmZip -DestinationPath $NssmDir -Force
-        if (-not $KeepDownloads) { Remove-Item -LiteralPath $nssmZip -Force -ErrorAction SilentlyContinue }
-        $nssmExe = Get-ChildItem -Path $NssmDir -Filter nssm.exe -Recurse | Where-Object { $_.FullName -match '\\win64\\' } | Select-Object -First 1 -ExpandProperty FullName
-        if (-not $nssmExe) { $nssmExe = Get-ChildItem -Path $NssmDir -Filter nssm.exe -Recurse | Select-Object -First 1 -ExpandProperty FullName }
-        if (-not $nssmExe) { throw "nssm.exe не найден после распаковки в $NssmDir" }
-    }
-    Write-Host "  ✓ $nssmExe"
-
-    # ─── Выбор целевой версии ───
+    # ─── Выбор целевой версии (до любых деструктивных действий) ───
     Write-Step "Выбор версии Ollama"
     $targetVersion = $null
     if ($currentVersion -and -not $forceDL) {
         Write-Host "  Текущая версия: $currentVersion" -ForegroundColor Cyan
         $resolvedVersion = Resolve-OllamaVersion -RequestedVersion $OllamaVersion -CurrentVersion $currentVersion -ForceRefresh:$forceDL
         if ($resolvedVersion -is [string] -and $resolvedVersion -eq 'CANCEL') {
-            Write-Host "`n  Установка отменена пользователем." -ForegroundColor Yellow
+            Write-Host "`n  Установка отменена пользователем. Служба не тронута." -ForegroundColor Yellow
             if (-not $NoPause) { Read-Host 'Нажмите Enter для выхода' | Out-Null }
             exit 0
         }
@@ -720,7 +671,7 @@ try {
     } else {
         $targetVersion = Resolve-OllamaVersion -RequestedVersion $OllamaVersion -CurrentVersion $currentVersion -ForceRefresh:$forceDL
         if ($targetVersion -is [string] -and $targetVersion -eq 'CANCEL') {
-            Write-Host "`n  Установка отменена пользователем." -ForegroundColor Yellow
+            Write-Host "`n  Установка отменена пользователем. Служба не тронута." -ForegroundColor Yellow
             if (-not $NoPause) { Read-Host 'Нажмите Enter для выхода' | Out-Null }
             exit 0
         }
@@ -740,7 +691,7 @@ try {
             if (-not $Force) {
                 $ans = Read-Host "Переустановить текущую версию $currentVersion? [Y/n]"
                 if ($ans -eq 'n' -or $ans -eq 'N') {
-                    Write-Host "`n  Установка отменена пользователем." -ForegroundColor Yellow
+                    Write-Host "`n  Установка отменена пользователем. Служба не тронута." -ForegroundColor Yellow
                     if (-not $NoPause) { Read-Host 'Нажмите Enter для выхода' | Out-Null }
                     exit 0
                 }
@@ -753,11 +704,84 @@ try {
         Write-Host "`n  → Первичная установка: $targetVersion" -ForegroundColor Cyan
     }
 
-    $downloadUrl = "https://github.com/ollama/ollama/releases/download/$targetVersion/ollama-windows-amd64.zip"
+    # ─── Итоговая сводка перед началом работы ───
     $needsBackup = ($currentVersion -and (Test-Path $OllamaDir))
-    $backupPath = $null
+    Write-Host ""
+    Write-Host "  План действий:" -ForegroundColor Cyan
+    Write-Host "    • Текущая версия : $(if($currentVersion){$currentVersion} else {'—'})"
+    Write-Host "    • Целевая версия : $targetVersion"
+    Write-Host "    • Режим          : $(if($isReinstall){'переустановка'} elseif($isUpgrade){'обновление/даунгрейд'} else {'первичная установка'})"
+    Write-Host "    • Бэкап          : $(if($needsBackup){'будет создан'} else {'не требуется'})"
 
-    # ─── Бэкап ───
+    if (-not $Force -and $needsBackup) {
+        Write-Host ""
+        if ((Read-Host 'Продолжить? [Y/n]') -eq 'n') {
+            Write-Host "  Отменено. Служба не тронута." -ForegroundColor Yellow
+            if (-not $NoPause) { Read-Host 'Нажмите Enter для выхода' | Out-Null }
+            exit 0
+        }
+    }
+
+    $downloadUrl = "https://github.com/ollama/ollama/releases/download/$targetVersion/ollama-windows-amd64.zip"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ЭТАП 2: Подготовка окружения (служба, каталоги, NSSM)
+    # ══════════════════════════════════════════════════════════════════════
+
+    if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+        Write-Step "Остановка существующей службы $ServiceName"
+        & sc.exe stop $ServiceName 2>&1 | Out-Null
+        Start-Sleep -Seconds 2
+    }
+    Stop-OllamaProcesses
+
+    Write-Step "Проверка порта $Port"
+    $busy = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if ($busy) {
+        $pids = ($busy.OwningProcess | Sort-Object -Unique) -join ', '
+        Write-Warning "Порт $Port уже занят PID: $pids"
+        if (-not $Force) {
+            $ans = Read-Host 'Продолжить? [y/N]'
+            if ($ans -ne 'y') { throw 'Отменено пользователем' }
+        }
+    } else {
+        Write-Host '  ✓ Свободен'
+    }
+
+    Write-Step 'Создание каталогов'
+    $dirsToCreate = @($OllamaDir, $ModelsDir, $LogsDir, $NssmDir, $OllamaHome, $NewProfile, $DownloadsDir, $BackupDir)
+    foreach ($d in ($dirsToCreate | Select-Object -Unique)) {
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        Write-Host "  ✓ $d"
+    }
+
+    Write-Step 'Права доступа'
+    Set-OllamaAcl -OllamaDir $OllamaDir -OllamaHome $OllamaHome -ModelsDir $ModelsDir -NewProfile $NewProfile
+    Write-Host "  ✓ Права Full Control выданы (SYSTEM + Administrators)"
+
+    Write-Step "Установка NSSM в $NssmDir"
+    $nssmExe = Get-ChildItem -Path $NssmDir -Filter nssm.exe -Recurse -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '\\win64\\' } |
+        Select-Object -First 1 -ExpandProperty FullName
+
+    if (-not $nssmExe -or $forceDL) {
+        $nssmZipName = Get-FileNameFromUrl -Url $NssmUrl -Fallback 'NSSM.zip'
+        $nssmVer = if ($NssmUrl -match '/download/([^/]+)/') { $matches[1] -replace '^v', '' } else { 'unknown' }
+        $nssmSubDir = "nssm_$nssmVer"
+        $nssmZip     = Get-CachedFile -Url $NssmUrl -FileName $nssmZipName -SubDir $nssmSubDir -ForceRedownload:$forceDL
+        Expand-Archive -Path $nssmZip -DestinationPath $NssmDir -Force
+        if (-not $KeepDownloads) { Remove-Item -LiteralPath $nssmZip -Force -ErrorAction SilentlyContinue }
+        $nssmExe = Get-ChildItem -Path $NssmDir -Filter nssm.exe -Recurse | Where-Object { $_.FullName -match '\\win64\\' } | Select-Object -First 1 -ExpandProperty FullName
+        if (-not $nssmExe) { $nssmExe = Get-ChildItem -Path $NssmDir -Filter nssm.exe -Recurse | Select-Object -First 1 -ExpandProperty FullName }
+        if (-not $nssmExe) { throw "nssm.exe не найден после распаковки в $NssmDir" }
+    }
+    Write-Host "  ✓ $nssmExe"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ЭТАП 3: Бэкап и установка новой версии
+    # ══════════════════════════════════════════════════════════════════════
+
+    $backupPath = $null
     if ($needsBackup) {
         Write-Step "Создание резервной копии"
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -774,7 +798,6 @@ try {
         }
     }
 
-    # ─── Подготовка каталогов после бэкапа ───
     Write-Step "Подготовка каталогов после бэкапа"
     New-Item -ItemType Directory -Force -Path $OllamaDir | Out-Null
     New-Item -ItemType Directory -Force -Path $LogsDir | Out-Null
@@ -783,7 +806,6 @@ try {
     Write-Host "  ✓ $LogsDir"
     Write-Host "  ✓ $NewProfile"
 
-    # Восстановление профиля и логов
     if ($needsBackup) {
         $backupProfile = Join-Path $backupPath '.ollama'
         if (Test-Path $backupProfile) {
@@ -798,11 +820,9 @@ try {
         }
     }
 
-    # Повторное применение ACL
     Set-OllamaAcl -OllamaDir $OllamaDir -OllamaHome $OllamaHome -ModelsDir $ModelsDir -NewProfile $NewProfile
     Write-Host "  ✓ Права Full Control повторно применены"
 
-    # ─── Установка Ollama ───
     Write-Step "Установка Ollama в $OllamaDir"
     if ($needsBackup -or -not (Test-Path $ollamaExe) -or $forceDL) {
         Write-Host "  → Целевая версия: $targetVersion" -ForegroundColor Green
@@ -821,7 +841,10 @@ try {
     elseif ($verRaw -match 'version is ([\d\.]+)') { $verDisplay = "v$($matches[1])" }
     Write-Host "  ✓ $verDisplay"
 
-    # ─── Переменные окружения ───
+    # ══════════════════════════════════════════════════════════════════════
+    # ЭТАП 4: Окружение, служба, запуск
+    # ══════════════════════════════════════════════════════════════════════
+
     Write-Step 'Переменные окружения (Machine)'
     [Environment]::SetEnvironmentVariable('OLLAMA_HOST',   $OllamaHost, 'Machine')
     [Environment]::SetEnvironmentVariable('OLLAMA_MODELS', $ModelsDir,  'Machine')
@@ -831,7 +854,6 @@ try {
         Add-ToMachinePath -Dir $OllamaDir
     }
 
-    # ─── Брандмауэр ───
     if ($FirewallEnabled -and -not [string]::IsNullOrWhiteSpace($FirewallSubnet)) {
         Write-Step "Правило брандмауэра ($FirewallSubnet)"
         $ruleName = "Ollama API ($FirewallSubnet)"
@@ -840,7 +862,6 @@ try {
         Write-Host "  ✓ $ruleName"
     }
 
-    # ─── Миграция профиля ───
     if ((Test-Path $OldProfile) -and -not (Test-Path (Join-Path $NewProfile 'id_ed25519'))) {
         Write-Step "Миграция профиля из $OldProfile"
         Copy-Item -Path "$OldProfile\*" -Destination $NewProfile -Recurse -Force -ErrorAction SilentlyContinue
@@ -848,7 +869,6 @@ try {
         Write-Host "  ✓ Скопировано в $NewProfile"
     }
 
-    # ─── Регистрация службы ───
     Write-Step "Регистрация службы $ServiceName"
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
         Write-Host '  → Остановка старой службы'
@@ -898,7 +918,6 @@ try {
 
     Write-Host '  ✓ Служба сконфигурирована'
 
-    # ─── Запуск ───
     Write-Step 'Запуск службы'
     $ok = Start-OllamaService -NssmExe $nssmExe -ServiceName $ServiceName -TimeoutSec $StartTimeoutSec -MaxAttempts 3
     if (-not $ok) {
@@ -907,7 +926,6 @@ try {
         throw "Служба $ServiceName не запустилась. Смотрите диагностику выше."
     }
 
-    # ─── Проверка API ───
     Write-Step 'Проверка API (локально)'
     $maxAttempts = 15
     $apiOk = $false
@@ -926,7 +944,6 @@ try {
         Write-Warning "API не ответил за $($maxAttempts * 2) секунд."
     }
 
-    # ─── Скачивание моделей ───
     $pulledModels = @()
     if ($DownloadModels) {
         Write-Step 'Скачивание моделей'
@@ -956,7 +973,6 @@ try {
         }
     }
 
-    # ─── Итог ───
     $actionLabel = if ($isReinstall) { 'переустановка' } elseif ($isUpgrade) { 'обновление/даунгрейд' } else { 'первичная установка' }
     Write-Host "`n=============================" -ForegroundColor Green
     Write-Host " Развёртывание завершено ($actionLabel)" -ForegroundColor Green
