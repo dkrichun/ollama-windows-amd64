@@ -203,7 +203,7 @@ try {
 
     Write-Step "Архивы: $DownloadsDir"
     if (Test-Path $DownloadsDir) {
-        if ($PurgeDownloads) { if (Confirm-Action "Удалить $DownloadsDir?") { Remove-Item -LiteralPath $DownloadsDir -Recurse -Force; Write-Host '  ✓ Удалён' } }
+        if ($PurgeDownloads) { if (Confirm-Action "Удалить $DownloadsDir (включая подпапки версий)?") { Remove-Item -LiteralPath $DownloadsDir -Recurse -Force; Write-Host '  ✓ Удалён' } }
         else { Write-Host '  ℹ Сохранён (используйте -PurgeDownloads)' }
     }
 
