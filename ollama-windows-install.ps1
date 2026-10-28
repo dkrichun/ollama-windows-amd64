@@ -4,11 +4,11 @@
     Развёртывание и обновление Ollama как службы Windows.
 
 .DESCRIPTION
-    Читает ollama-windows-install.ini. При наличии установленной версии предлагает
-    обновление (с возможностью выбора версии, исключая текущую). Перед обновлением
-    делает резервную копию в папку Backup, останавливает службу, удаляет и
-    пересоздает её заново. Скачанные архивы сохраняются в подпапки 
-    Downloads\ollama_@version@ и Downloads\nssm_@version@.
+    Читает ollama-windows-install.ini. Позволяет выбрать любую версию, включая
+    уже установленную (в этом случае выполняется переустановка с пересозданием
+    службы). Перед установкой/переустановкой делает резервную копию в папку
+    Backup. Скачанные архивы сохраняются в подпапки Downloads\ollama_@version@
+    и Downloads\nssm_@version@.
 #>
 [CmdletBinding()]
 param(
@@ -202,7 +202,6 @@ function Get-FileNameFromUrl {
     return $Fallback
 }
 
-# ─── Кэширование файлов с подпапками ───
 function Get-CachedFile {
     param(
         [string]$Url,
@@ -279,16 +278,12 @@ function Test-IsPrerelease {
     return ($Release.prerelease -or $Release.tag_name -match '-(rc|beta|alpha)')
 }
 
-# ─── ИСПРАВЛЕННЫЙ ВЫБОР ВЕРСИИ ───
+# ─── ВЫБОР ВЕРСИИ: показывает ВСЕ версии, помечает текущую ───
 function Select-OllamaVersionInteractive {
     param($Releases, [string]$CurrentVersion)
     if (-not $Releases) { return $null }
 
     $stable = @($Releases | Where-Object { -not (Test-IsPrerelease $_) })
-    if ($CurrentVersion) {
-        $stable = @($stable | Where-Object { $_.tag_name -ne $CurrentVersion })
-    }
-
     if ($stable.Count -eq 0) {
         Write-Warning '  Нет доступных версий для установки.'
         return $null
@@ -297,12 +292,12 @@ function Select-OllamaVersionInteractive {
     $list = $stable[0..([math]::Min(14, $stable.Count-1))]
     Write-Host ''
     Write-Host 'Доступные версии Ollama:' -ForegroundColor Cyan
-    if ($CurrentVersion) {
-        Write-Host "  (текущая версия $CurrentVersion исключена из списка)" -ForegroundColor DarkGray
-    }
     for ($i = 0; $i -lt $list.Count; $i++) {
         $date = ([datetime]$list[$i].published_at).ToString('yyyy-MM-dd')
-        Write-Host ('  [{0}] {1,-16} {2}' -f ($i+1), $list[$i].tag_name, $date)
+        $mark = if ($CurrentVersion -and $list[$i].tag_name -eq $CurrentVersion) {
+            ' <-- текущая (переустановка)'
+        } else { '' }
+        Write-Host ('  [{0}] {1,-16} {2}  {3}' -f ($i+1), $list[$i].tag_name, $date, $mark) -ForegroundColor $(if ($mark) { 'Yellow' } else { 'White' })
     }
     Write-Host ''
 
@@ -321,7 +316,7 @@ function Select-OllamaVersionInteractive {
     }
 }
 
-# ─── ИСПРАВЛЕННЫЙ RESOLVE ───
+# ─── РАЗРЕШЕНИЕ ВЕРСИИ: latest больше не исключает текущую ───
 function Resolve-OllamaVersion {
     param([string]$RequestedVersion, [string]$CurrentVersion, [switch]$ForceRefresh)
     
@@ -341,7 +336,8 @@ function Resolve-OllamaVersion {
         return $null
     }
 
-    $latest = @($releases | Where-Object { -not (Test-IsPrerelease $_) } | Where-Object { $_.tag_name -ne $CurrentVersion }) | Select-Object -First 1
+    # latest: возвращаем самую свежую (даже если она же установлена)
+    $latest = @($releases | Where-Object { -not (Test-IsPrerelease $_) }) | Select-Object -First 1
     if ($latest) { return $latest.tag_name }
     return $null
 }
@@ -464,6 +460,94 @@ function Select-ModelsInteractive {
     return $selected
 }
 
+# ─── Запуск службы с retry и диагностикой ───
+function Start-OllamaService {
+    param(
+        [string]$NssmExe,
+        [string]$ServiceName,
+        [int]$TimeoutSec,
+        [int]$MaxAttempts = 3
+    )
+
+    $started = $false
+    $lastStatus = ''
+    
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        Write-Host "  → Попытка запуска $attempt из $MaxAttempts..."
+        
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $svc) { throw "Служба $ServiceName не найдена после установки" }
+        
+        if ($svc.Status -eq 'Running') {
+            $started = $true
+            break
+        }
+        
+        $nssmOut = & $NssmExe start $ServiceName 2>&1
+        if ($nssmOut) { Write-Host "    NSSM: $nssmOut" -ForegroundColor DarkGray }
+        
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastStatus = ''
+        while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+            $svc.Refresh()
+            $status = $svc.Status
+            
+            if ($status -ne $lastStatus) {
+                Write-Host "    Статус: $status"
+                $lastStatus = $status
+            }
+            
+            if ($status -eq 'Running') { $started = $true; break }
+            
+            if ($status -eq 'Stopped' -and $sw.Elapsed.TotalSeconds -gt 3) {
+                Write-Warning "  ⚠ Служба упала через $([int]$sw.Elapsed.TotalSeconds) сек после запуска"
+                break
+            }
+            
+            Start-Sleep -Milliseconds 500
+        }
+        
+        if ($started) { break }
+        
+        if ($attempt -lt $MaxAttempts) {
+            Write-Host "  → Пауза 5 сек перед повтором..."
+            Start-Sleep -Seconds 5
+        }
+    }
+    
+    if ($started) {
+        Write-Host "  ✓ Статус: Running" -ForegroundColor Green
+        return $true
+    }
+
+    Write-Host ""
+    Write-Warning "Служба не запустилась за $MaxAttempts × $TimeoutSec сек."
+
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svc) {
+        Write-Host "  Текущий статус : $($svc.Status)" -ForegroundColor Yellow
+    }
+    try {
+        $svcInfo = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue
+        if ($svcInfo -and $null -ne $svcInfo.ExitCode) {
+            Write-Host "  ExitCode       : $($svcInfo.ExitCode)" -ForegroundColor Yellow
+        }
+    } catch {}
+
+    $errLog = Join-Path $LogsDir 'ollama.err.log'
+    if (Test-Path $errLog) {
+        Write-Host "`n  Последние 20 строк $errLog :" -ForegroundColor Yellow
+        Get-Content $errLog -Tail 20 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    }
+    $outLog = Join-Path $LogsDir 'ollama.out.log'
+    if (Test-Path $outLog) {
+        Write-Host "`n  Последние 10 строк $outLog :" -ForegroundColor Yellow
+        Get-Content $outLog -Tail 10 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    }
+
+    return $false
+}
+
 try {
     $ollamaExe = Join-Path $OllamaDir 'ollama.exe'
     $currentVersion = $null
@@ -524,7 +608,6 @@ try {
 
     if (-not $nssmExe -or $forceDL) {
         $nssmZipName = Get-FileNameFromUrl -Url $NssmUrl -Fallback 'NSSM.zip'
-        # Извлекаем версию из URL и создаем подпапку nssm_@version@
         $nssmVer = if ($NssmUrl -match '/download/([^/]+)/') { $matches[1] -replace '^v', '' } else { 'unknown' }
         $nssmSubDir = "nssm_$nssmVer"
         $nssmZip     = Get-CachedFile -Url $NssmUrl -FileName $nssmZipName -SubDir $nssmSubDir -ForceRedownload:$forceDL
@@ -536,7 +619,7 @@ try {
     }
     Write-Host "  ✓ $nssmExe"
 
-    # ─── Определение целевой версии ───
+    # ─── Выбор целевой версии ───
     Write-Step "Выбор версии Ollama"
     $targetVersion = $null
     if ($currentVersion -and -not $forceDL) {
@@ -548,13 +631,8 @@ try {
             exit 0
         }
         if (-not $resolvedVersion) {
-            if ($Force) { throw "Нет доступных новых версий для автоматической установки." }
-            $ans = Read-Host "Нет новых версий. Переустановить текущую $currentVersion? [y/N]"
-            if ($ans -eq 'y') { $resolvedVersion = $currentVersion } else { 
-                Write-Host "`n  Установка отменена пользователем." -ForegroundColor Yellow
-                if (-not $NoPause) { Read-Host 'Нажмите Enter для выхода' | Out-Null }
-                exit 0 
-            }
+            if ($Force) { throw "Не удалось определить версию." }
+            $resolvedVersion = $currentVersion
         }
         $targetVersion = $resolvedVersion
     } else {
@@ -570,11 +648,34 @@ try {
         }
     }
 
+    # ─── Определяем режим: переустановка или обновление/даунгрейд ───
+    $isReinstall = $false
+    $isUpgrade   = $false
+    if ($currentVersion -and $targetVersion) {
+        if ($currentVersion -eq $targetVersion) {
+            $isReinstall = $true
+            Write-Host "`n  ℹ Выбрана та же версия: $targetVersion (переустановка с пересозданием службы)" -ForegroundColor Yellow
+            if (-not $Force) {
+                $ans = Read-Host "Переустановить текущую версию $currentVersion? [Y/n]"
+                if ($ans -eq 'n' -or $ans -eq 'N') {
+                    Write-Host "`n  Установка отменена пользователем." -ForegroundColor Yellow
+                    if (-not $NoPause) { Read-Host 'Нажмите Enter для выхода' | Out-Null }
+                    exit 0
+                }
+            }
+        } else {
+            $isUpgrade = $true
+            Write-Host "`n  → Обновление/даунгрейд: $currentVersion → $targetVersion" -ForegroundColor Cyan
+        }
+    } elseif ($targetVersion) {
+        Write-Host "`n  → Первичная установка: $targetVersion" -ForegroundColor Cyan
+    }
+
     $downloadUrl = "https://github.com/ollama/ollama/releases/download/$targetVersion/ollama-windows-amd64.zip"
-    $isUpdate = ($currentVersion -and $targetVersion -and $currentVersion -ne $targetVersion)
     
-    # ─── Бэкап при обновлении ───
-    if ($isUpdate -and (Test-Path $OllamaDir)) {
+    # ─── Бэкап (при любой смене/переустановке) ───
+    $needsBackup = ($currentVersion -and (Test-Path $OllamaDir))
+    if ($needsBackup) {
         Write-Step "Создание резервной копии"
         $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
         $backupName = "Ollama_$timestamp"
@@ -596,23 +697,26 @@ try {
         }
     }
 
-    # ─── Установка Ollama ───
+    # ─── Установка / переустановка Ollama ───
     Write-Step "Установка Ollama в $OllamaDir"
-    if (-not (Test-Path $ollamaExe) -or $forceDL -or $isUpdate) {
+    if ($needsBackup -or -not (Test-Path $ollamaExe) -or $forceDL) {
         Write-Host "  → Целевая версия: $targetVersion" -ForegroundColor Green
         $ollamaZipName = 'ollama-windows-amd64.zip'
-        # Формируем подпапку ollama_@version@ (без префикса v)
         $ollamaSubDir = 'ollama_' + ($targetVersion -replace '^v', '')
         $ollamaZip     = Get-CachedFile -Url $downloadUrl -FileName $ollamaZipName -SubDir $ollamaSubDir -ForceRedownload:$forceDL
         Expand-Archive -Path $ollamaZip -DestinationPath $OllamaDir -Force
         if (-not $KeepDownloads) { Remove-Item -LiteralPath $ollamaZip -Force -ErrorAction SilentlyContinue }
     } else {
-        Write-Host "  ℹ Ollama уже установлена: $currentVersion (пропускаем скачивание)"
+        Write-Host "  ℹ Установка не требуется (используется текущая)"
     }
 
-    $ver = (& $ollamaExe --version 2>&1) -join ' '
+    # ─── Проверка бинарника ───
+    $verRaw = (& $ollamaExe --version 2>&1) -join ' '
     if ($LASTEXITCODE -ne 0) { throw "ollama.exe --version завершился с кодом $LASTEXITCODE." }
-    Write-Host "  ✓ $ver"
+    $verDisplay = $verRaw
+    if ($verRaw -match 'client version is ([\d\.]+)') { $verDisplay = "v$($matches[1])" }
+    elseif ($verRaw -match 'version is ([\d\.]+)') { $verDisplay = "v$($matches[1])" }
+    Write-Host "  ✓ $verDisplay"
 
     # ─── Переменные окружения ───
     Write-Step 'Переменные окружения (Machine)'
@@ -640,16 +744,40 @@ try {
         Write-Host "  ✓ Скопировано в $NewProfile"
     }
 
-    # ─── Регистрация службы ───
+    # ─── Регистрация службы (пересоздаётся всегда при наличии старой) ───
     Write-Step "Регистрация службы $ServiceName"
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+        Write-Host '  → Остановка старой службы'
+        & $nssmExe stop $ServiceName 2>&1 | Out-Null
+        
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ((Get-Service $ServiceName -ErrorAction SilentlyContinue).Status -ne 'Stopped' -and $sw.Elapsed.TotalSeconds -lt 15) {
+            Start-Sleep -Milliseconds 500
+        }
+        
         Write-Host '  → Удаление старой службы'
-        & $nssmExe stop   $ServiceName 2>&1 | Out-Null
-        Start-Sleep -Seconds 1
         & $nssmExe remove $ServiceName confirm 2>&1 | Out-Null
-        Start-Sleep -Seconds 1
+        
+        $sw.Restart()
+        while ((Get-Service $ServiceName -ErrorAction SilentlyContinue) -and $sw.Elapsed.TotalSeconds -lt 15) {
+            Start-Sleep -Milliseconds 500
+        }
+        
+        if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
+            Write-Warning "  NSSM не удалил службу, принудительно через sc.exe"
+            & sc.exe delete $ServiceName 2>&1 | Out-Null
+            Start-Sleep -Seconds 2
+        }
+        
+        if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
+            throw "Не удалось удалить старую службу $ServiceName"
+        }
     }
+
     & $nssmExe install $ServiceName $ollamaExe serve 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Ошибка NSSM при установке службы (код $LASTEXITCODE)."
+    }
     & $nssmExe set $ServiceName AppDirectory $OllamaDir 2>&1 | Out-Null
     & $nssmExe set $ServiceName Start $StartType 2>&1 | Out-Null
     & $nssmExe set $ServiceName Description "Ollama is the most popular way to build with open models. Access the latest open models with complete privacy locally or in the cloud. Your prompts are never stored or trained on." 2>&1 | Out-Null
@@ -666,13 +794,14 @@ try {
 
     Write-Host '  ✓ Служба сконфигурирована'
 
-    # ─── Запуск ───
+    # ─── Запуск (с retry и обработкой timeout) ───
     Write-Step 'Запуск службы'
-    & $nssmExe start $ServiceName 2>&1 | Out-Null
-    $svc = Get-Service -Name $ServiceName
-    $svc.WaitForStatus('Running', [TimeSpan]::FromSeconds($StartTimeoutSec))
-    Write-Host "  ✓ Статус: $($svc.Status)"
+    $ok = Start-OllamaService -NssmExe $nssmExe -ServiceName $ServiceName -TimeoutSec $StartTimeoutSec -MaxAttempts 3
+    if (-not $ok) {
+        throw "Служба $ServiceName не запустилась. Проверьте логи в $LogsDir."
+    }
 
+    # ─── Проверка API ───
     Write-Step 'Проверка API (локально)'
     $maxAttempts = 15
     $apiOk = $false
@@ -689,10 +818,6 @@ try {
     }
     if (-not $apiOk) {
         Write-Warning "API не ответил за $($maxAttempts * 2) секунд."
-        if (-not $Force) {
-            $ans = Read-Host 'Продолжить завершение? [y/N]'
-            if ($ans -ne 'y') { throw 'Прервано пользователем' }
-        }
     }
 
     # ─── Скачивание моделей ───
@@ -725,8 +850,10 @@ try {
         }
     }
 
+    # ─── Итог ───
+    $actionLabel = if ($isReinstall) { 'переустановка' } elseif ($isUpgrade) { 'обновление/даунгрейд' } else { 'первичная установка' }
     Write-Host "`n=============================" -ForegroundColor Green
-    Write-Host ' Развёртывание завершено'     -ForegroundColor Green
+    Write-Host " Развёртывание завершено ($actionLabel)" -ForegroundColor Green
     Write-Host '=============================' -ForegroundColor Green
     Write-Host " Служба      : $ServiceName"
     Write-Host " Версия      : $(if($currentVersion){$currentVersion} else {'не была установлена'}) -> $(if($targetVersion){$targetVersion} else {'N/A'})"
@@ -734,14 +861,14 @@ try {
     Write-Host " Модели      : $ModelsDir"
     Write-Host " Профиль     : $NewProfile"
     Write-Host " Логи        : $LogsDir"
-    
     if ($targetVersion) {
         Write-Host " Архивы      : $DownloadsDir\ollama_$($targetVersion -replace '^v','')"
-    } else {
-        Write-Host " Архивы      : $DownloadsDir"
     }
-    
-    Write-Host " Бэкапы      : $BackupDir"
+    if ($needsBackup) {
+        Write-Host " Бэкап       : $backupPath"
+    } else {
+        Write-Host " Бэкапы      : $BackupDir (не требуется)"
+    }
     Write-Host " API локально: http://127.0.0.1:$Port"
     Write-Host " Performance : KeepAlive=$KeepAlive, FA=$faValue, KvCache=$KvCacheType"
     
