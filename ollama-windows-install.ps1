@@ -177,14 +177,14 @@ if (-not [string]::IsNullOrWhiteSpace($Origins)) { $envPairs += "OLLAMA_ORIGINS=
 if ($DebugMode) { $envPairs += "OLLAMA_DEBUG=1" }
 
 $testEnv = @{
-    'USERPROFILE'            = $OllamaHome
-    'HOME'                   = $OllamaHome
-    'OLLAMA_HOST'            = $OllamaHost
-    'OLLAMA_MODELS'          = $ModelsDir
-    'OLLAMA_KEEP_ALIVE'      = $KeepAlive
-    'OLLAMA_FLASH_ATTENTION' = $faValue
-    'OLLAMA_KV_CACHE_TYPE'   = $KvCacheType
-    'OLLAMA_NUM_PARALLEL'    = "$NumParallel"
+    'USERPROFILE'              = $OllamaHome
+    'HOME'                     = $OllamaHome
+    'OLLAMA_HOST'              = $OllamaHost
+    'OLLAMA_MODELS'            = $ModelsDir
+    'OLLAMA_KEEP_ALIVE'        = $KeepAlive
+    'OLLAMA_FLASH_ATTENTION'   = $faValue
+    'OLLAMA_KV_CACHE_TYPE'     = $KvCacheType
+    'OLLAMA_NUM_PARALLEL'      = "$NumParallel"
     'OLLAMA_MAX_LOADED_MODELS' = "$MaxLoadedModels"
 }
 
@@ -267,10 +267,14 @@ function Add-ToMachinePath {
     if ($null -eq $current) { $current = '' }
     $parts = $current -split ';' | Where-Object { $_ -ne '' }
     $normalized = $parts | ForEach-Object { $_.TrimEnd('\') }
-    if ($normalized -contains $Dir.TrimEnd('\')) { return }
+    if ($normalized -contains $Dir.TrimEnd('\')) {
+        Write-Host "  ℹ Уже в PATH: $Dir (пропускаем)" -ForegroundColor DarkGray
+        return
+    }
     $new = if ($current.TrimEnd(';') -eq '') { $Dir } else { $current.TrimEnd(';') + ';' + $Dir }
     [Environment]::SetEnvironmentVariable('Path', $new, 'Machine')
     Write-Host "  ✓ Добавлено в PATH: $Dir"
+    Write-Host "  ℹ Изменения вступят в силу в новых консолях" -ForegroundColor DarkGray
 }
 
 # ─── GitHub Releases ───
@@ -652,7 +656,6 @@ try {
         Write-Host "`n  ℹ Ollama не установлена — будет выполнена первичная установка." -ForegroundColor Cyan
     }
 
-    # ─── Выбор целевой версии (до любых деструктивных действий) ───
     Write-Step "Выбор версии Ollama"
     $targetVersion = $null
     if ($currentVersion -and -not $forceDL) {
@@ -681,7 +684,6 @@ try {
         }
     }
 
-    # ─── Определяем режим ───
     $isReinstall = $false
     $isUpgrade   = $false
     if ($currentVersion -and $targetVersion) {
@@ -704,7 +706,6 @@ try {
         Write-Host "`n  → Первичная установка: $targetVersion" -ForegroundColor Cyan
     }
 
-    # ─── Итоговая сводка перед началом работы ───
     $needsBackup = ($currentVersion -and (Test-Path $OllamaDir))
     Write-Host ""
     Write-Host "  План действий:" -ForegroundColor Cyan
@@ -848,10 +849,14 @@ try {
     Write-Step 'Переменные окружения (Machine)'
     [Environment]::SetEnvironmentVariable('OLLAMA_HOST',   $OllamaHost, 'Machine')
     [Environment]::SetEnvironmentVariable('OLLAMA_MODELS', $ModelsDir,  'Machine')
-    
+    Write-Host "  ✓ OLLAMA_HOST=$OllamaHost"
+    Write-Host "  ✓ OLLAMA_MODELS=$ModelsDir"
+
     if ($AddToPath) {
         Write-Step "Переменная PATH (Machine)"
         Add-ToMachinePath -Dir $OllamaDir
+    } else {
+        Write-Host "`n  ℹ AddToPath=false — PATH не изменяем" -ForegroundColor DarkGray
     }
 
     if ($FirewallEnabled -and -not [string]::IsNullOrWhiteSpace($FirewallSubnet)) {
