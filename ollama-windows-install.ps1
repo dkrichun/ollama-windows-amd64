@@ -288,7 +288,6 @@ function Select-OllamaVersionInteractive {
     Write-Host 'Доступные версии Ollama:' -ForegroundColor Cyan
     for ($i = 0; $i -lt $list.Count; $i++) {
         $date = ([datetime]$list[$i].published_at).ToString('yyyy-MM-dd')
-        $mark = if ($i -eq 0 -and $list[$i].tag_name -match 'latest') { '' } else { '' }
         Write-Host ('  [{0}] {1,-16} {2}' -f ($i+1), $list[$i].tag_name, $date)
     }
     Write-Host ''
@@ -482,14 +481,15 @@ try {
         Write-Host "  ✓ $d"
     }
 
-    # ─── Права доступа ───
+    # ─── Права доступа (SID для любой локализации Windows) ───
     Write-Step 'Права доступа'
-    icacls $OllamaHome /grant 'SYSTEM:(OI)(CI)F' | Out-Null
-    icacls $OllamaHome /grant 'Administrators:(OI)(CI)F' | Out-Null
-    icacls $ModelsDir /grant 'SYSTEM:(OI)(CI)F' | Out-Null
-    icacls $ModelsDir /grant 'Administrators:(OI)(CI)F' | Out-Null
-    icacls $NewProfile /grant 'SYSTEM:(OI)(CI)F' /T | Out-Null
-    icacls $NewProfile /grant 'Administrators:(OI)(CI)F' /T | Out-Null
+    # S-1-5-18 = SYSTEM, S-1-5-32-544 = Administrators (Администраторы)
+    icacls $OllamaHome /grant '*S-1-5-18:(OI)(CI)F' | Out-Null
+    icacls $OllamaHome /grant '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+    icacls $ModelsDir /grant '*S-1-5-18:(OI)(CI)F' | Out-Null
+    icacls $ModelsDir /grant '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+    icacls $NewProfile /grant '*S-1-5-18:(OI)(CI)F' /T | Out-Null
+    icacls $NewProfile /grant '*S-1-5-32-544:(OI)(CI)F' /T | Out-Null
     Write-Host "  ✓ Права Full Control выданы на $OllamaDir, $ModelsDir, $NewProfile"
 
     # ─── NSSM ───
@@ -702,7 +702,6 @@ try {
         try {
             $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.|0\.)' -and $_.PrefixOrigin -ne 'WellKnown' }
             foreach ($ip in $ips) {
-                if ($ip.IPAddress -match '^([\d\.]+)/(\d+)$') {} # dummy
                 $networkIp = $FirewallSubnet -replace '/.*$'
                 $prefixLen = [int]($FirewallSubnet -replace '^.*/', '')
                 $ipBytes = ([System.Net.IPAddress]::Parse($ip.IPAddress)).GetAddressBytes()
