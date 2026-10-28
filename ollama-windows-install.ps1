@@ -7,7 +7,8 @@
     Читает ollama-windows-install.ini. При наличии установленной версии предлагает
     обновление (с возможностью выбора версии, исключая текущую). Перед обновлением
     делает резервную копию в папку Backup, останавливает службу, удаляет и
-    пересоздает её заново. Скачанные архивы сохраняются в подпапки Downloads\<версия>\.
+    пересоздает её заново. Скачанные архивы сохраняются в подпапки 
+    Downloads\ollama_@version@ и Downloads\nssm_@version@.
 #>
 [CmdletBinding()]
 param(
@@ -201,10 +202,18 @@ function Get-FileNameFromUrl {
     return $Fallback
 }
 
+# ─── Кэширование файлов с подпапками ───
 function Get-CachedFile {
-    param([string]$Url, [string]$FileName, [string]$SubDir = '', [switch]$ForceRedownload)
+    param(
+        [string]$Url,
+        [string]$FileName,
+        [string]$SubDir = '',
+        [switch]$ForceRedownload
+    )
     $targetDir = if ([string]::IsNullOrWhiteSpace($SubDir)) { $DownloadsDir } else { Join-Path $DownloadsDir $SubDir }
-    if (-not (Test-Path -LiteralPath $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $targetDir)) {
+        New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+    }
     $cachePath = Join-Path $targetDir $FileName
     $urlStamp  = "$cachePath.url"
 
@@ -270,7 +279,7 @@ function Test-IsPrerelease {
     return ($Release.prerelease -or $Release.tag_name -match '-(rc|beta|alpha)')
 }
 
-# ─── ИСПРАВЛЕННАЯ ФУНКЦИЯ ВЫБОРА ВЕРСИИ ───
+# ─── ИСПРАВЛЕННЫЙ ВЫБОР ВЕРСИИ ───
 function Select-OllamaVersionInteractive {
     param($Releases, [string]$CurrentVersion)
     if (-not $Releases) { return $null }
@@ -297,32 +306,25 @@ function Select-OllamaVersionInteractive {
     }
     Write-Host ''
 
-    # Цикл на случай неверного ввода
     while ($true) {
         Write-Host 'Введите номер версии (Enter — последняя, s — отмена):' -ForegroundColor Cyan
         $ans = (Read-Host 'Выбор').Trim()
 
-        # Пустой ввод — выбрать последнюю
         if ([string]::IsNullOrWhiteSpace($ans)) { return $list[0] }
-
-        # Отмена: s, S, c, C (лат.), ы, Ы, с, С (кир.)
         if ($ans -match '^[scысSCЫС]$') { return 'CANCEL' }
 
-        # Номер из списка
         $n = 0
         if ([int]::TryParse($ans, [ref]$n) -and $n -ge 1 -and $n -le $list.Count) {
             return $list[$n-1]
         }
-
         Write-Warning "  Некорректный ввод: '$ans'. Введите число от 1 до $($list.Count), 's' для отмены или Enter."
     }
 }
 
-# ─── ИСПРАВЛЕННАЯ ФУНКЦИЯ ОПРЕДЕЛЕНИЯ ВЕРСИИ ───
+# ─── ИСПРАВЛЕННЫЙ RESOLVE ───
 function Resolve-OllamaVersion {
     param([string]$RequestedVersion, [string]$CurrentVersion, [switch]$ForceRefresh)
     
-    # Явно заданная версия (v0.40.10 или 0.40.10)
     if ($RequestedVersion -match '^v?\d+\.\d+\.\d+$') {
         if (-not $RequestedVersion.StartsWith('v')) { return "v$RequestedVersion" }
         return $RequestedVersion
@@ -331,17 +333,14 @@ function Resolve-OllamaVersion {
     $releases = Get-OllamaReleases -ForceRefresh:$ForceRefresh
     if (-not $releases) { return $null }
 
-    # Интерактивный выбор
     if ($RequestedVersion -eq 'ask' -and -not $Force) {
         $sel = Select-OllamaVersionInteractive -Releases $releases -CurrentVersion $CurrentVersion
-        # КРИТИЧНО: пробрасываем отмену наверх, не проваливаясь в "latest"
         if ($sel -is [string] -and $sel -eq 'CANCEL') { return 'CANCEL' }
         if ($null -eq $sel) { return $null }
         if ($sel.tag_name) { return $sel.tag_name }
         return $null
     }
 
-    # Автоматический выбор (latest или -Force)
     $latest = @($releases | Where-Object { -not (Test-IsPrerelease $_) } | Where-Object { $_.tag_name -ne $CurrentVersion }) | Select-Object -First 1
     if ($latest) { return $latest.tag_name }
     return $null
@@ -469,17 +468,13 @@ try {
     $ollamaExe = Join-Path $OllamaDir 'ollama.exe'
     $currentVersion = $null
     
-    # ─── Проверка текущей версии (более надёжный regex) ───
+    # ─── Проверка текущей версии ───
     if (Test-Path $ollamaExe) {
         $verOut = (& $ollamaExe --version 2>&1) -join ' '
         if ($verOut -match '(\d+\.\d+\.\d+)') {
             $currentVersion = "v$($matches[1])"
             Write-Host "`n  ℹ Обнаружена установленная версия: $currentVersion" -ForegroundColor Green
-        } else {
-            Write-Host "`n  ⚠ Не удалось распознать текущую версию из вывода ollama." -ForegroundColor Yellow
         }
-    } else {
-        Write-Host "`n  ℹ Ollama не установлена — будет выполнена первичная установка." -ForegroundColor Cyan
     }
 
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
@@ -511,7 +506,7 @@ try {
         Write-Host "  ✓ $d"
     }
 
-    # ─── Права доступа (SID) ───
+    # ─── Права доступа ───
     Write-Step 'Права доступа'
     icacls $OllamaHome /grant '*S-1-5-18:(OI)(CI)F' | Out-Null
     icacls $OllamaHome /grant '*S-1-5-32-544:(OI)(CI)F' | Out-Null
@@ -529,7 +524,10 @@ try {
 
     if (-not $nssmExe -or $forceDL) {
         $nssmZipName = Get-FileNameFromUrl -Url $NssmUrl -Fallback 'NSSM.zip'
-        $nssmZip     = Get-CachedFile -Url $NssmUrl -FileName $nssmZipName -ForceRedownload:$forceDL
+        # Извлекаем версию из URL и создаем подпапку nssm_@version@
+        $nssmVer = if ($NssmUrl -match '/download/([^/]+)/') { $matches[1] -replace '^v', '' } else { 'unknown' }
+        $nssmSubDir = "nssm_$nssmVer"
+        $nssmZip     = Get-CachedFile -Url $NssmUrl -FileName $nssmZipName -SubDir $nssmSubDir -ForceRedownload:$forceDL
         Expand-Archive -Path $nssmZip -DestinationPath $NssmDir -Force
         if (-not $KeepDownloads) { Remove-Item -LiteralPath $nssmZip -Force -ErrorAction SilentlyContinue }
         $nssmExe = Get-ChildItem -Path $NssmDir -Filter nssm.exe -Recurse | Where-Object { $_.FullName -match '\\win64\\' } | Select-Object -First 1 -ExpandProperty FullName
@@ -544,7 +542,6 @@ try {
     if ($currentVersion -and -not $forceDL) {
         Write-Host "  Текущая версия: $currentVersion" -ForegroundColor Cyan
         $resolvedVersion = Resolve-OllamaVersion -RequestedVersion $OllamaVersion -CurrentVersion $currentVersion -ForceRefresh:$forceDL
-        # Обработка отмены пользователем
         if ($resolvedVersion -is [string] -and $resolvedVersion -eq 'CANCEL') {
             Write-Host "`n  Установка отменена пользователем." -ForegroundColor Yellow
             if (-not $NoPause) { Read-Host 'Нажмите Enter для выхода' | Out-Null }
@@ -562,7 +559,6 @@ try {
         $targetVersion = $resolvedVersion
     } else {
         $targetVersion = Resolve-OllamaVersion -RequestedVersion $OllamaVersion -CurrentVersion $currentVersion -ForceRefresh:$forceDL
-        # Обработка отмены
         if ($targetVersion -is [string] -and $targetVersion -eq 'CANCEL') {
             Write-Host "`n  Установка отменена пользователем." -ForegroundColor Yellow
             if (-not $NoPause) { Read-Host 'Нажмите Enter для выхода' | Out-Null }
@@ -605,7 +601,9 @@ try {
     if (-not (Test-Path $ollamaExe) -or $forceDL -or $isUpdate) {
         Write-Host "  → Целевая версия: $targetVersion" -ForegroundColor Green
         $ollamaZipName = 'ollama-windows-amd64.zip'
-        $ollamaZip     = Get-CachedFile -Url $downloadUrl -FileName $ollamaZipName -SubDir $targetVersion -ForceRedownload:$forceDL
+        # Формируем подпапку ollama_@version@ (без префикса v)
+        $ollamaSubDir = 'ollama_' + ($targetVersion -replace '^v', '')
+        $ollamaZip     = Get-CachedFile -Url $downloadUrl -FileName $ollamaZipName -SubDir $ollamaSubDir -ForceRedownload:$forceDL
         Expand-Archive -Path $ollamaZip -DestinationPath $OllamaDir -Force
         if (-not $KeepDownloads) { Remove-Item -LiteralPath $ollamaZip -Force -ErrorAction SilentlyContinue }
     } else {
@@ -736,7 +734,13 @@ try {
     Write-Host " Модели      : $ModelsDir"
     Write-Host " Профиль     : $NewProfile"
     Write-Host " Логи        : $LogsDir"
-    Write-Host " Архивы      : $DownloadsDir\<версия>\"
+    
+    if ($targetVersion) {
+        Write-Host " Архивы      : $DownloadsDir\ollama_$($targetVersion -replace '^v','')"
+    } else {
+        Write-Host " Архивы      : $DownloadsDir"
+    }
+    
     Write-Host " Бэкапы      : $BackupDir"
     Write-Host " API локально: http://127.0.0.1:$Port"
     Write-Host " Performance : KeepAlive=$KeepAlive, FA=$faValue, KvCache=$KvCacheType"
