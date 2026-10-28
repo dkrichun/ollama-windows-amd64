@@ -126,13 +126,20 @@ function Find-Nssm {
 function Remove-FromMachinePath {
     param([string]$Dir)
     $current = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    if ($null -eq $current -or $current.Trim() -eq '') { return }
+    if ($null -eq $current -or $current.Trim() -eq '') {
+        Write-Host '  ℹ PATH не задан'
+        return
+    }
     $parts = $current -split ';' | Where-Object { $_ -ne '' }
     $target = $Dir.TrimEnd('\')
     $kept = $parts | Where-Object { $_.TrimEnd('\') -ne $target }
-    if ($kept.Count -eq $parts.Count) { return }
+    if ($kept.Count -eq $parts.Count) {
+        Write-Host "  ℹ $Dir в PATH не найден"
+        return
+    }
     [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'Machine')
     Write-Host "  ✓ $Dir удалён из PATH"
+    Write-Host '  ℹ Изменения вступят в силу в новых консолях.'
 }
 
 try {
