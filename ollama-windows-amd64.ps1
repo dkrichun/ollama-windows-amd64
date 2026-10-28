@@ -4,37 +4,28 @@
     Развёртывание Ollama как службы Windows с сетевым доступом.
 
 .DESCRIPTION
-    Читает ollama-windows-amd64.ini, скачивает NSSM и Ollama, распаковывает,
-    настраивает Machine-переменные (OLLAMA_HOST/OLLAMA_MODELS), добавляет
-    OllamaDir в Machine PATH (если AddToPath=true), настраивает брандмауэр,
-    ротацию логов NSSM и политику восстановления, регистрирует службу,
-    запускает и проверяет API с повторами. После успешного health-check
-    при необходимости скачивает выбранные модели через `ollama pull`.
-
-    Скачанные архивы по умолчанию сохраняются рядом со скриптом
-    (см. [downloads] DownloadCacheDir / KeepDownloads в INI) и переиспользуются
-    при следующих запусках. URL-стамп "<archive>.url" позволяет автоматически
-    перекачать архив, если URL в INI изменился.
+    Читает ollama-windows-amd64.ini, при необходимости запрашивает список
+    релизов через GitHub API и позволяет выбрать версию Ollama интерактивно
+    или автоматически. Скачивает NSSM и Ollama, распаковывает, настраивает
+    Machine-переменные (OLLAMA_HOST/OLLAMA_MODELS), добавляет OllamaDir в
+    Machine PATH (если AddToPath=true), настраивает брандмауэр, ротацию логов
+    NSSM и политику восстановления, регистрирует службу, запускает и проверяет
+    API с повторами. После успешного health-check при необходимости скачивает
+    выбранные модели через `ollama pull`.
 
 .PARAMETER ConfigPath
     Путь к INI. По умолчанию — рядом со скриптом.
 
 .PARAMETER Force
-    Не задавать интерактивных вопросов (в том числе не показывать меню моделей —
-    качать ровно то, что указано в [models] Models).
+    Не задавать интерактивных вопросов (в том числе не показывать меню
+    выбора версии Ollama и меню моделей).
 
 .PARAMETER ForceDownload
     Принудительно перекачать и переустановить NSSM и Ollama, даже если
-    кэшированные архивы уже есть.
+    кэшированные архивы уже есть. Также сбрасывает кэш списка релизов.
 
 .PARAMETER NoPause
     Не ждать Enter в конце (для Планировщика/CI).
-
-.EXAMPLE
-    .\ollama-windows-amd64.ps1
-
-.EXAMPLE
-    .\ollama-windows-amd64.ps1 -ForceDownload -Force -NoPause
 #>
 [CmdletBinding()]
 param(
@@ -127,16 +118,17 @@ $LogsDir          = Get-Cfg     'paths'     'LogsDir'              ''
 $OllamaHome       = Get-Cfg     'ollama'    'OllamaHome'           $OllamaDir
 $ServiceName      = Get-Cfg     'service'   'ServiceName'          'Ollama'
 $StartType        = Get-Cfg     'service'   'StartType'            'SERVICE_DELAYED_AUTO_START'
-$StartTimeoutSec  = Get-CfgInt  'service'   'StartTimeoutSeconds'  45
+$StartTimeoutSec  = Get-CfgInt  'service'   'StartTimeoutSeconds'  60
 $AppRestartDelay  = Get-CfgInt  'service'   'AppRestartDelay'      10000
 $AddToPath        = Get-CfgBool 'service'   'AddToPath'            $true
 $HostOnly         = Get-Cfg     'network'   'Host'                 '0.0.0.0'
 $Port             = Get-CfgInt  'network'   'Port'                 11434
 $FirewallEnabled  = Get-CfgBool 'network'   'FirewallEnabled'      $true
-$FirewallSubnet   = Get-Cfg     'network'   'FirewallSubnet'       ''
+$FirewallSubnet   = Get-Cfg     'network'   'FirewallSubnet'       '192.168.117.0/24'
 $Origins          = Get-Cfg     'network'   'Origins'              ''
+$OllamaVersion    = Get-Cfg     'downloads' 'OllamaVersion'        'ask'
 $NssmUrl          = Get-Cfg     'downloads' 'NssmUrl'              'https://github.com/dkxce/NSSM/releases/download/v2.25/NSSM_v2.25.zip'
-$OllamaUrl        = Get-Cfg     'downloads' 'OllamaUrl'            'https://github.com/ollama/ollama/releases/download/v0.40.1/ollama-windows-amd64.zip'
+$OllamaUrlFallback = Get-Cfg    'downloads' 'OllamaUrl'            'https://github.com/ollama/ollama/releases/download/v0.40.10/ollama-windows-amd64.zip'
 $DownloadCacheDir = Get-Cfg     'downloads' 'DownloadCacheDir'     ''
 $KeepDownloads    = Get-CfgBool 'downloads' 'KeepDownloads'        $true
 $DownloadModels   = Get-CfgBool 'models'    'DownloadModels'       $true
@@ -182,7 +174,7 @@ if ($KvCacheType -notin @('f16','q8_0','q4_0')) {
     Write-Warning "Неизвестный KvCacheType='$KvCacheType'. Допустимые: f16, q8_0, q4_0. Оставляем как есть."
 }
 
-# Формируем блок переменных для AppEnvironmentExtra (все в одном вызове!)
+# Формируем блок переменных для AppEnvironmentExtra
 $envPairs = @(
     "USERPROFILE=$OllamaHome",
     "HOME=$OllamaHome",
@@ -277,6 +269,105 @@ function Add-ToMachinePath {
     Write-Host "  ℹ Изменения PATH вступят в силу в новых консолях."
 }
 
+# ─── GitHub Releases ───
+function Get-OllamaReleases {
+    param([switch]$ForceRefresh)
+    $cacheFile = Join-Path $scriptDir '.ollama_releases_cache.json'
+    $cacheTtl  = 12 * 60 * 60  # 12 часов
+
+    if (-not $ForceRefresh -and (Test-Path -LiteralPath $cacheFile)) {
+        $age = (Get-Date) - (Get-Item -LiteralPath $cacheFile).LastWriteTime
+        if ($age.TotalSeconds -lt $cacheTtl) {
+            try {
+                Write-Host '  ℹ Используем кэш списка релизов (обновляется каждые 12 часов)'
+                return (Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json)
+            } catch {
+                Write-Host '  ℹ Кэш повреждён, запрашиваем заново'
+            }
+        }
+    }
+
+    $headers = @{ 'User-Agent' = 'PowerShell-Ollama-Deploy-Script'; 'Accept' = 'application/vnd.github+json' }
+    $apiUrl  = 'https://api.github.com/repos/ollama/ollama/releases?per_page=30'
+    try {
+        Write-Host '  → Запрос списка релизов с GitHub...'
+        $releases = Invoke-RestMethod -Uri $apiUrl -Headers $headers -ErrorAction Stop
+        $releases | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
+        return $releases
+    } catch {
+        Write-Warning "  ✗ Не удалось получить список релизов: $($_.Exception.Message)"
+        if (Test-Path -LiteralPath $cacheFile) {
+            Write-Host '  ℹ Используем устаревший кэш'
+            return (Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json)
+        }
+        return $null
+    }
+}
+
+function Test-IsPrerelease {
+    param($Release)
+    return ($Release.prerelease -or $Release.tag_name -match '-(rc|beta|alpha)')
+}
+
+function Select-OllamaVersionInteractive {
+    param($Releases)
+    if (-not $Releases) { return $null }
+
+    $stable = @($Releases | Where-Object { -not (Test-IsPrerelease $_) })
+    if ($stable.Count -eq 0) {
+        Write-Warning '  Стабильных релизов не найдено.'
+        return $null
+    }
+
+    $showCount = [math]::Min(15, $stable.Count)
+    $list = $stable[0..($showCount-1)]
+
+    Write-Host ''
+    Write-Host 'Доступные стабильные версии Ollama (с GitHub):' -ForegroundColor Cyan
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        $r     = $list[$i]
+        $tag   = $r.tag_name
+        $date  = ([datetime]$r.published_at).ToString('yyyy-MM-dd')
+        $mark  = if ($i -eq 0) { '<-- latest' } else { '' }
+        Write-Host ('  [{0}] {1,-16} {2}  {3}' -f ($i+1), $tag, $date, $mark)
+    }
+    Write-Host ''
+    Write-Host 'Введите номер версии (Enter — последняя стабильная, s — отмена):' -ForegroundColor Cyan
+    $ans = Read-Host 'Выбор'
+    if ([string]::IsNullOrWhiteSpace($ans)) { return $list[0] }
+    if ($ans -eq 's') { return $null }
+
+    $n = 0
+    if ([int]::TryParse($ans, [ref]$n) -and $n -ge 1 -and $n -le $list.Count) {
+        return $list[$n-1]
+    }
+    Write-Warning '  Неверный номер, выбираем последнюю стабильную.'
+    return $list[0]
+}
+
+function Resolve-OllamaVersion {
+    param([string]$RequestedVersion, [switch]$ForceRefresh)
+    
+    # Поддержка версий как с 'v', так и без (например, v0.40.10 или 0.40.10)
+    if ($RequestedVersion -match '^v?\d+\.\d+\.\d+$') {
+        if (-not $RequestedVersion.StartsWith('v')) {
+            return "v$RequestedVersion"
+        }
+        return $RequestedVersion
+    }
+    
+    $releases = Get-OllamaReleases -ForceRefresh:$ForceRefresh
+    if (-not $releases) { return $null }
+
+    if ($RequestedVersion -eq 'ask' -and -not $Force) {
+        $sel = Select-OllamaVersionInteractive -Releases $releases
+        if ($sel) { return $sel.tag_name }
+    }
+    $latest = @($releases | Where-Object { -not (Test-IsPrerelease $_) }) | Select-Object -First 1
+    if ($latest) { return $latest.tag_name }
+    return $null
+}
+
 # ─── Модели ───
 function Test-ModelInstalled {
     param([string]$Exe, [string]$Model)
@@ -299,9 +390,9 @@ function Invoke-PullModel {
     $prevHost = $env:OLLAMA_HOST
     $prevModels = $env:OLLAMA_MODELS
     try {
-        $env:OLLAMA_HOST   = $ApiHost         # CLI подключается к локальному API
+        $env:OLLAMA_HOST   = $ApiHost
         $env:OLLAMA_MODELS = $ModelsDir
-        
+
         # Альтернативный вывод: пайп отключает интерактивный TUI.
         # Очищаем \r и пустые строки, чтобы прогресс не "наезжал" сам на себя.
         & $Exe pull $Model 2>&1 | ForEach-Object {
@@ -310,7 +401,7 @@ function Invoke-PullModel {
                 Write-Host "    $line"
             }
         }
-        
+
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  ✓ $Model загружена" -ForegroundColor Green
             return $true
@@ -325,7 +416,6 @@ function Invoke-PullModel {
 
 function Select-ModelsInteractive {
     param([string[]]$Preselected)
-    # Меню с рекомендациями для 8 ГБ VRAM
     $menu = @(
         [pscustomobject]@{ Name='llama3.1:8b';      Desc='Общий чат · Q4_K_M ≈ 4.9 ГБ' }
         [pscustomobject]@{ Name='qwen2.5:7b';       Desc='Баланс качества · Q4_K_M ≈ 4.7 ГБ' }
@@ -431,12 +521,29 @@ try {
     # ─── 8. Ollama ───
     Write-Step "Установка Ollama в $OllamaDir"
     $ollamaExe = Join-Path $OllamaDir 'ollama.exe'
+
     if (-not (Test-Path $ollamaExe) -or $forceDL) {
-        $ollamaZipName = Get-FileNameFromUrl -Url $OllamaUrl -Fallback 'ollama-windows-amd64.zip'
-        $ollamaZip     = Get-CachedFile -Url $OllamaUrl -FileName $ollamaZipName -ForceRedownload:$forceDL
+        # Определяем версию
+        $resolvedVersion = Resolve-OllamaVersion -RequestedVersion $OllamaVersion -ForceRefresh:$forceDL
+        if ($resolvedVersion) {
+            $downloadUrl = "https://github.com/ollama/ollama/releases/download/$resolvedVersion/ollama-windows-amd64.zip"
+            Write-Host "  ✓ Выбрана версия: $resolvedVersion" -ForegroundColor Green
+        } else {
+            Write-Warning '  ⚠ Не удалось определить версию через API. Используем резервный URL из INI.'
+            $downloadUrl = $OllamaUrlFallback
+            $resolvedVersion = ($downloadUrl -split '/')[-3]
+        }
+
+        $ollamaZipName = 'ollama-windows-amd64.zip'
+        $ollamaZip     = Get-CachedFile -Url $downloadUrl -FileName $ollamaZipName -ForceRedownload:$forceDL
         Expand-Archive -Path $ollamaZip -DestinationPath $OllamaDir -Force
         Remove-CacheIfNotKept -Path $ollamaZip
+    } else {
+        $existingVer = (& $ollamaExe --version 2>&1) -join ' '
+        Write-Host "  ℹ Ollama уже установлена: $existingVer (пропускаем скачивание)"
+        Write-Host '  ℹ Для принудительного обновления используйте -ForceDownload'
     }
+
     $ver = (& $ollamaExe --version 2>&1) -join ' '
     if ($LASTEXITCODE -ne 0) {
         throw "ollama.exe --version завершился с кодом $LASTEXITCODE. Проверьте зависимости (VC++ Runtime) и целостность архива."
@@ -494,18 +601,13 @@ try {
     & $nssmExe install $ServiceName $ollamaExe serve                           2>&1 | Out-Null
     & $nssmExe set $ServiceName AppDirectory $OllamaDir                        2>&1 | Out-Null
     & $nssmExe set $ServiceName Start $StartType                               2>&1 | Out-Null
-
-    # Единый вызов AppEnvironmentExtra со всеми переменными, включая performance
     & $nssmExe set $ServiceName AppEnvironmentExtra @envPairs 2>&1 | Out-Null
 
-    # Логи и ротация
     & $nssmExe set $ServiceName AppStdout (Join-Path $LogsDir 'ollama.out.log') 2>&1 | Out-Null
     & $nssmExe set $ServiceName AppStderr (Join-Path $LogsDir 'ollama.err.log') 2>&1 | Out-Null
     & $nssmExe set $ServiceName AppRotateFiles 1                               2>&1 | Out-Null
     & $nssmExe set $ServiceName AppRotateOnline 1                              2>&1 | Out-Null
-    & $nssmExe set $ServiceName AppRotateBytes 10485760                         2>&1 | Out-Null  # 10 MB
-
-    # Политика перезапуска при падении
+    & $nssmExe set $ServiceName AppRotateBytes 10485760                         2>&1 | Out-Null
     & $nssmExe set $ServiceName AppExit Default Restart                        2>&1 | Out-Null
     & $nssmExe set $ServiceName AppRestartDelay $AppRestartDelay               2>&1 | Out-Null
     & $nssmExe set $ServiceName AppThrottle 1500                              2>&1 | Out-Null
